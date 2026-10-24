@@ -16,6 +16,7 @@ func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	secret := os.Getenv("SECRET")
+	polkakey := os.Getenv("POLKA_KEY")
 	fmt.Printf("dbUrl : %s\n", dbURL)
 
 	// Can connect to any db using this
@@ -34,6 +35,7 @@ func main() {
 		serverRequests: atomic.Int32{},
 		db:             dbQueries,
 		secret:         secret,
+		polkakey:       polkakey,
 	}
 
 	// Register Handlers to the server

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,6 +21,7 @@ type apiConfig struct {
 	serverRequests atomic.Int32
 	db             *database.Queries
 	secret         string
+	polkakey       string
 }
 
 func (a *apiConfig) middlewareMetrics(next http.Handler) http.Handler {
@@ -178,12 +180,27 @@ type chirp struct {
 
 func (a *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	dbChirps, err := a.db.GetChirps(r.Context())
-	if err != nil {
-		replyWithError(w, 401, fmt.Sprintf("An error occured : %s\n", err.Error()))
-		return
+	author := r.URL.Query().Get("author_id")
+	var dbChirps []database.Chirp
+	var err error
+	uid, err := uuid.Parse(author)
+	if author == "" || err != nil {
+		dbChirps, err = a.db.GetChirps(r.Context())
+		if err != nil {
+			replyWithError(w, 401, fmt.Sprintf("An error occured : %s\n", err.Error()))
+			return
+		}
+	} else {
+		dbChirps, err = a.db.GetAuthorChirps(r.Context(), uuid.NullUUID{
+			UUID:  uid,
+			Valid: true,
+		})
+		if err != nil {
+			replyWithError(w, 401, fmt.Sprintf("An error occured : %s\n", err.Error()))
+			return
+		}
 	}
-
+	sortQuery := r.URL.Query().Get("sort")
 	var chirps []chirp
 	for _, cp := range dbChirps {
 		chirps = append(chirps, chirp{
@@ -192,6 +209,11 @@ func (a *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 			UpdatedAt: cp.UpdatedAt,
 			Body:      cp.Body,
 			User_id:   cp.UserID.UUID,
+		})
+	}
+	if sortQuery == "desc" {
+		sort.Slice(chirps, func(i int, j int) bool {
+			return chirps[i].CreatedAt.Compare(chirps[j].CreatedAt) == 1
 		})
 	}
 	replyWithJson(w, 200, chirps)
@@ -245,15 +267,17 @@ func (a *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ndbUser := struct {
-		ID        uuid.UUID    `json:"id"`
-		CreatedAt sql.NullTime `json:"created_at"`
-		UpdatedAt sql.NullTime `json:"updated_at"`
-		Email     string       `json:"email"`
+		ID         uuid.UUID    `json:"id"`
+		CreatedAt  sql.NullTime `json:"created_at"`
+		UpdatedAt  sql.NullTime `json:"updated_at"`
+		Email      string       `json:"email"`
+		IsChiryRed bool         `json:"is_chirpy_red"`
 	}{
-		ID:        dbUser.ID,
-		CreatedAt: dbUser.CreatedAt,
-		UpdatedAt: dbUser.UpdatedAt,
-		Email:     dbUser.Email,
+		ID:         dbUser.ID,
+		CreatedAt:  dbUser.CreatedAt,
+		UpdatedAt:  dbUser.UpdatedAt,
+		Email:      dbUser.Email,
+		IsChiryRed: dbUser.IsChirpyRed.Bool,
 	}
 
 	replyWithJson(w, 201, ndbUser)
@@ -309,6 +333,7 @@ func (a *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 		Email        string       `json:"email"`
 		Token        string       `json:"token"`
 		RefreshToken string       `json:"refresh_token"`
+		IsChiryRed   bool         `json:"is_chirpy_red"`
 	}{
 		ID:           isPresentUser.ID,
 		CreatedAt:    isPresentUser.CreatedAt,
@@ -316,6 +341,7 @@ func (a *apiConfig) loginUser(w http.ResponseWriter, r *http.Request) {
 		Email:        isPresentUser.Email,
 		Token:        token,
 		RefreshToken: refToken,
+		IsChiryRed:   isPresentUser.IsChirpyRed.Bool,
 	}
 
 	replyWithJson(w, 200, ndbUser)
@@ -417,15 +443,17 @@ func (a *apiConfig) updateUser(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 	payload := struct {
-		Email     string    `json:"email"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		ID        uuid.UUID `json:"id"`
+		Email      string    `json:"email"`
+		CreatedAt  time.Time `json:"created_at"`
+		UpdatedAt  time.Time `json:"updated_at"`
+		ID         uuid.UUID `json:"id"`
+		IsChiryRed bool      `json:"is_chirpy_red"`
 	}{
-		ID:        nUsr.ID,
-		Email:     nUsr.Email,
-		CreatedAt: nUsr.CreatedAt.Time,
-		UpdatedAt: nUsr.UpdatedAt.Time,
+		ID:         nUsr.ID,
+		Email:      nUsr.Email,
+		CreatedAt:  nUsr.CreatedAt.Time,
+		UpdatedAt:  nUsr.UpdatedAt.Time,
+		IsChiryRed: nUsr.IsChirpyRed.Bool,
 	}
 	replyWithJson(w, 200, payload)
 
@@ -467,5 +495,37 @@ func (a *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *apiConfig) upgradeUser(w http.ResponseWriter, r *http.Request) {
-
+	type body struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserId string `json:"user_id"`
+		} `json:"data"`
+	}
+	defer r.Body.Close()
+	clientKey, err := auth.GetAPIKey(r.Header)
+	if err != nil || clientKey != a.polkakey {
+		replyWithError(w, 401, "Unauthorized")
+		return
+	}
+	var bd body
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&bd); err != nil {
+		replyWithError(w, 400, "What?")
+		return
+	}
+	if bd.Event != "user.upgraded" {
+		replyWithJson(w, 204, "")
+		return
+	}
+	uid, err := uuid.Parse(bd.Data.UserId)
+	if err != nil {
+		replyWithError(w, 400, "What?")
+		return
+	}
+	err = a.db.UpgradeChirpyToRed(r.Context(), uid)
+	if err != nil {
+		replyWithError(w, 404, "User not found")
+		return
+	}
+	replyWithJson(w, 204, "User ugraded")
 }
