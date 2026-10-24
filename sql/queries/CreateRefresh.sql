@@ -1,0 +1,18 @@
+-- name: CreateRefresh :exec
+insert into refresh_tokens 
+(
+   token,
+    created_at,
+    updated_at,
+    user_id,
+    expires_at,
+    revoked_at
+)
+values (
+    $1,
+    NOW(),
+    NOW(),
+    $2,
+    $3,
+    null
+);
